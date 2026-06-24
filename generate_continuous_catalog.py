@@ -1,156 +1,187 @@
 import pandas as pd
 import json
 import numpy as np
-from nltk.corpus import wordnet as wn
+import os
 from nltk.stem import WordNetLemmatizer
 import nltk
+from sentence_transformers import SentenceTransformer, util
+import torch
 
-# Ensure NLTK resources are available
+# Setup NLTK
 nltk.download('wordnet', quiet=True)
-nltk.download('omw-1.4', quiet=True)
-
 lemmatizer = WordNetLemmatizer()
 
-def get_wn_pos(oxford_pos):
-    """Maps Oxford POS tags to NLTK/WordNet POS constants."""
-    if oxford_pos == 'n.':
-        return wn.NOUN
-    elif oxford_pos == 'v.' or oxford_pos == 'modal v.':
-        return wn.VERB
-    elif oxford_pos == 'adj.':
-        return wn.ADJ
-    elif oxford_pos == 'adv.':
-        return wn.ADV
-    return None
-
 def get_lemmatizer_pos(oxford_pos):
-    """Maps Oxford POS tags to Lemmatizer POS constants."""
-    if oxford_pos == 'n.':
-        return 'n'
-    elif oxford_pos == 'v.' or oxford_pos == 'modal v.':
-        return 'v'
-    elif oxford_pos == 'adj.':
-        return 'a'
-    elif oxford_pos == 'adv.':
-        return 'r'
+    if oxford_pos == 'n.': return 'n'
+    if oxford_pos in ['v.', 'modal v.']: return 'v'
+    if oxford_pos == 'adj.': return 'a'
+    if oxford_pos == 'adv.': return 'r'
     return 'n'
 
-def get_lexname(word, oxford_pos, concreteness):
-    # Functional POS list: pronoun, preposition, determiner, conjunction
-    functional_pos = ['pron.', 'prep.', 'det.', 'conj.', 'exclam.', 'number']
-
-    # THE "UNIVERSAL" GATEKEEPER RULE
-    if oxford_pos in functional_pos or concreteness < 3.0:
-        return "universal"
-
-    # Map Oxford POS to WordNet POS
-    wn_pos = get_wn_pos(oxford_pos)
-
-    if wn_pos:
-        synsets = wn.synsets(word, pos=wn_pos)
-    else:
-        synsets = wn.synsets(word)
-
-    if synsets:
-        return synsets[0].lexname()
-    return "universal"
+def normalize_pos_oxford_to_cefrj(pos):
+    mapping = {
+        'n.': 'noun',
+        'v.': 'verb',
+        'adj.': 'adjective',
+        'adv.': 'adverb',
+        'pron.': 'pronoun',
+        'prep.': 'preposition',
+        'det.': 'determiner',
+        'conj.': 'conjunction',
+        'modal v.': 'modal auxiliary',
+        'exclam.': 'interjection',
+        'number': 'number',
+        'part.': 'adverb' # fallback
+    }
+    return mapping.get(pos, 'noun')
 
 def main():
-    print("Loading Oxford data...")
+    print("Loading datasets...")
     with open('raw_extracted_data.json', 'r') as f:
         oxford_data = json.load(f)
-
     df_oxford = pd.DataFrame(oxford_data)
     df_oxford.rename(columns={'level': 'orig_cefr'}, inplace=True)
 
-    # Lemmatize Oxford words for joining
-    print("Lemmatizing Oxford words...")
+    df_cefrj = pd.read_csv('cefrj-vocabulary-profile-1.5.csv')
+    # Normalize CEFR-J POS to simplify matching
+    cefrj_pos_norm = {
+        'be-verb': 'verb',
+        'do-verb': 'verb',
+        'have-verb': 'verb',
+        'adjective': 'adjective',
+        'adverb': 'adverb',
+        'conjunction': 'conjunction',
+        'determiner': 'determiner',
+        'interjection': 'interjection',
+        'modal auxiliary': 'modal auxiliary',
+        'noun': 'noun',
+        'number': 'number',
+        'preposition': 'preposition',
+        'pronoun': 'pronoun',
+        'verb': 'verb'
+    }
+    df_cefrj['pos_norm'] = df_cefrj['pos'].map(cefrj_pos_norm)
+
+    with open('target_categories.json', 'r') as f:
+        target_categories = json.load(f)
+
+    # Feature Enrichment
+    print("Enriching features (joining Oxford and CEFR-J)...")
     df_oxford['w_lemma'] = df_oxford.apply(
-        lambda row: lemmatizer.lemmatize(row['w'].lower(), get_lemmatizer_pos(row['pos'])),
-        axis=1
+        lambda row: lemmatizer.lemmatize(row['w'].lower(), get_lemmatizer_pos(row['pos'])), axis=1
+    )
+    df_oxford['pos_norm'] = df_oxford['pos'].apply(normalize_pos_oxford_to_cefrj)
+
+    # Left join
+    df = pd.merge(
+        df_oxford,
+        df_cefrj[['headword', 'pos_norm', 'CoreInventory 1', 'CoreInventory 2', 'Threshold']],
+        left_on=['w_lemma', 'pos_norm'],
+        right_on=['headword', 'pos_norm'],
+        how='left'
     )
 
-    # Load AoA
-    print("Loading AoA dataset...")
+    def build_anchor(row):
+        labels = []
+        for col in ['CoreInventory 1', 'CoreInventory 2', 'Threshold']:
+            val = row[col]
+            if pd.notna(val) and str(val).strip():
+                labels.append(str(val))
+
+        if labels:
+            return ", ".join(labels), False
+        else:
+            # Fallback
+            pos_name = row['pos_norm']
+            return f"{row['w']} {pos_name}", True
+
+    anchors = df.apply(build_anchor, axis=1)
+    df['semantic_anchor'] = [a[0] for a in anchors]
+    df['is_derived_semantically'] = [a[1] for a in anchors]
+
+    # Difficulty Scoring (re-using external sets logic)
+    print("Calculating difficulty scores...")
     df_aoa = pd.read_excel('AoA_51715_words.xlsx', usecols=['Word', 'AoA_Kup_lem'])
     df_aoa['Word'] = df_aoa['Word'].astype(str).str.lower()
-    # Handle duplicates by taking mean
     df_aoa = df_aoa.groupby('Word')['AoA_Kup_lem'].mean().reset_index()
 
-    # Load Concreteness
-    print("Loading Concreteness dataset...")
     df_conc = pd.read_excel('Concreteness_ratings_Brysbaert_et_al_BRM.xlsx', usecols=['Word', 'Conc.M'])
     df_conc['Word'] = df_conc['Word'].astype(str).str.lower()
-    # Handle duplicates by taking mean
     df_conc = df_conc.groupby('Word')['Conc.M'].mean().reset_index()
 
-    # Merge on Lemma
-    print("Merging datasets...")
-    df = pd.merge(df_oxford, df_aoa, left_on='w_lemma', right_on='Word', how='left')
+    df = pd.merge(df, df_aoa, left_on='w_lemma', right_on='Word', how='left')
     df = pd.merge(df, df_conc, left_on='w_lemma', right_on='Word', how='left')
 
-    # Imputation logic: Median by CEFR and POS
-    print("Performing median imputation...")
+    # Imputation
     medians = df.groupby(['orig_cefr', 'pos'], as_index=False)[['AoA_Kup_lem', 'Conc.M']].median()
     medians.columns = ['orig_cefr', 'pos', 'AoA_median', 'Conc_median']
-
     df = pd.merge(df, medians, on=['orig_cefr', 'pos'], how='left')
     df['AoA_Kup_lem'] = df['AoA_Kup_lem'].fillna(df['AoA_median'])
     df['Conc.M'] = df['Conc.M'].fillna(df['Conc_median'])
-
-    # Global fallbacks
+    # Global fallback
     df['AoA_Kup_lem'] = df['AoA_Kup_lem'].fillna(df['AoA_Kup_lem'].median())
-    df['Conc.M'] = df['Conc.M'].fillna(df['Conc.M'].median())
+    df['Conc.M'] = df['Conc.M'].fillna(df['Conc_median'])
 
     # Normalization
-    print("Normalizing scores...")
     aoa_min, aoa_max = df['AoA_Kup_lem'].min(), df['AoA_Kup_lem'].max()
     conc_min, conc_max = df['Conc.M'].min(), df['Conc.M'].max()
+    cefr_map = {'A1': 0.0, 'A2': 0.2, 'B1': 0.4, 'B2': 0.6, 'C1': 0.8}
 
     df['AoA_norm'] = (df['AoA_Kup_lem'] - aoa_min) / (aoa_max - aoa_min)
     df['Conc_norm'] = (df['Conc.M'] - conc_min) / (conc_max - conc_min)
+    df['CEFR_norm'] = df['orig_cefr'].map(cefr_map)
 
-    # Formula: Score = (0.7 * AoA_norm) + (0.3 * (1 - Conc_norm))
-    df['difficulty_score'] = (0.7 * df['AoA_norm']) + (0.3 * (1 - df['Conc_norm']))
+    df['difficulty_score'] = (0.5 * df['AoA_norm']) + (0.2 * (1 - df['Conc_norm'])) + (0.3 * df['CEFR_norm'])
 
-    # Lexnames with Universal Rule
-    print("Mapping Lexnames and applying Universal Rule...")
-    df['lexname'] = df.apply(lambda row: get_lexname(row['w'], row['pos'], row['Conc.M']), axis=1)
+    # Semantic Mapping
+    print("Initialising Sentence-Transformer (all-MiniLM-L6-v2)...")
+    model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    # Sort and rank
+    print("Computing category centroids...")
+    cat_keys = list(target_categories.keys())
+    cat_texts = [f"{k}: {', '.join(target_categories[k])}" for k in cat_keys]
+    cat_embeddings = model.encode(cat_texts, convert_to_tensor=True)
+
+    print("Computing word embeddings and mapping themes...")
+    word_texts = df['semantic_anchor'].tolist()
+    word_embeddings = model.encode(word_texts, convert_to_tensor=True, show_progress_bar=True)
+
+    # Compute cosine similarities
+    cos_sims = util.cos_sim(word_embeddings, cat_embeddings)
+    best_cat_indices = torch.argmax(cos_sims, dim=1).tolist()
+    df['theme'] = [cat_keys[idx] for idx in best_cat_indices]
+
+    # Final sort and rank
     df = df.sort_values('difficulty_score').reset_index(drop=True)
     df['rank'] = df.index + 1
 
-    # Prepare final JSON structure
-    print("Saving to continuous_catalog.json...")
-    final_output = []
+    # Distribution analysis
+    print("\n--- TAXONOMY DISTRIBUTION ---")
+    dist = df['theme'].value_counts()
+    for theme, count in dist.items():
+        print(f"{theme}: {count} ({count/len(df)*100:.2f}%)")
+
+    # Export
+    print("\nExporting to cefr_catalog.json...")
+    output = []
     for _, row in df.iterrows():
-        entry = {
+        output.append({
+            "rank": int(row['rank']),
             "w": row['w'],
             "pos": row['pos'],
-            "difficulty_score": round(float(row['difficulty_score']), 4),
-            "rank": int(row['rank']),
-            "theme": row['lexname'],
-            "tr": "", # Placeholder for translation
+            "tr": "", # Hebrew placeholder
+            "theme": row['theme'],
+            "aoa": round(float(row['AoA_Kup_lem']), 2),
             "concreteness": round(float(row['Conc.M']), 2),
-            "orig_cefr": row['orig_cefr']
-        }
-        final_output.append(entry)
+            "difficulty_score": round(float(row['difficulty_score']), 4),
+            "orig_cefr": row['orig_cefr'],
+            "is_derived_semantically": bool(row['is_derived_semantically'])
+        })
 
-    with open('continuous_catalog.json', 'w') as f:
-        json.dump(final_output, f, indent=2)
+    with open('cefr_catalog.json', 'w') as f:
+        json.dump(output, f, indent=2)
 
-    print(f"Pipeline complete. {len(final_output)} words processed.")
-
-    # Sanity check for "Universal" rule
-    print("\n--- UNIVERSAL RULE CHECK ---")
-    abstract_word = df[df['w'] == 'globalization']
-    if not abstract_word.empty:
-        print(f"Globalization theme: {abstract_word.iloc[0]['lexname']} (Conc: {abstract_word.iloc[0]['Conc.M']})")
-
-    func_word = df[df['w'] == 'although']
-    if not func_word.empty:
-        print(f"Although theme: {func_word.iloc[0]['lexname']} (POS: {func_word.iloc[0]['pos']})")
+    print("Done!")
 
 if __name__ == "__main__":
     main()
